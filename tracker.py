@@ -51,13 +51,12 @@ async def register_send(payload: dict):
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO sends (track_id, recipient_email, subject, gmail_message_id)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO sends (track_id, recipient_email, gmail_message_id)
+            VALUES (%s, %s, %s)
             ON CONFLICT (track_id) DO NOTHING
         """, (
             payload["track_id"],
             payload["recipient_email"],
-            payload.get("subject"),
             payload.get("gmail_message_id"),
         ))
         conn.commit()
