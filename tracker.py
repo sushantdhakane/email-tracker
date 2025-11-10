@@ -30,6 +30,10 @@ async def log_requests(request: Request, call_next):
 async def health_check():
     return {"status": "ok"}
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 def get_conn():
     try:
         conn = psycopg2.connect(DB_URL, cursor_factory=RealDictCursor, connect_timeout=10, sslmode='require')
@@ -71,6 +75,10 @@ async def register_send(payload: dict):
 async def pixel(track_id: str, request: Request):
     if not valid_uuid(track_id):
         raise HTTPException(status_code=404)
+    ua = request.headers.get("User-Agent", "").lower()
+    if "cloudflare" in ua or "worker" in ua or "cron" in ua:
+        print(f"⚠️ Ignoring Cloudflare ping: {ua}")
+        return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
     conn = None
     cur = None
     try:
