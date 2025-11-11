@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2, os, uuid, io
@@ -143,3 +143,25 @@ def valid_uuid(value):
         return True
     except Exception:
         return False
+
+
+# New endpoint: /statuses
+@app.post("/statuses")
+def get_statuses(emails: list[str] = Body(...)):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 
+            s.recipient_email,
+            CASE 
+                WHEN EXISTS (SELECT 1 FROM events e WHERE e.track_id = s.track_id)
+                THEN 'read'
+                ELSE 'sent'
+            END AS status
+        FROM sends s
+        WHERE s.recipient_email = ANY(%s)
+    """, (emails,))
+    data = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {row["recipient_email"]: row["status"] for row in data}
