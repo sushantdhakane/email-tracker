@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2, os, uuid, io
@@ -127,31 +127,54 @@ async def click(track_id: str, url: str):
     conn.close()
     return RedirectResponse(decoded_url)
 
-@app.get("/status/{gmail_message_id}")
-def get_status(gmail_message_id: str):
+@app.get("/status")
+def get_status(
+    gmail_message_id: str = Query(...),
+    recipient_email: str = Query(None)
+):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT 
-            CASE 
-                WHEN EXISTS (
-                    SELECT 1 FROM events e
-                    JOIN sends s ON e.track_id = s.track_id
-                    WHERE s.gmail_message_id = %s
-                )
-                THEN 'read'
-                ELSE 'sent'
-            END AS status
-        FROM sends
-        WHERE gmail_message_id = %s
-        LIMIT 1
-    """, (gmail_message_id, gmail_message_id))
+
+    # Use both identifiers if recipient_email is provided
+    if recipient_email:
+        cur.execute("""
+            SELECT 
+                CASE 
+                    WHEN EXISTS (
+                        SELECT 1 FROM events e
+                        JOIN sends s ON e.track_id = s.track_id
+                        WHERE s.gmail_message_id = %s AND s.recipient_email = %s
+                    )
+                    THEN 'read'
+                    ELSE 'sent'
+                END AS status
+            FROM sends
+            WHERE gmail_message_id = %s AND recipient_email = %s
+            LIMIT 1
+        """, (gmail_message_id, recipient_email, gmail_message_id, recipient_email))
+    else:
+        cur.execute("""
+            SELECT 
+                CASE 
+                    WHEN EXISTS (
+                        SELECT 1 FROM events e
+                        JOIN sends s ON e.track_id = s.track_id
+                        WHERE s.gmail_message_id = %s
+                    )
+                    THEN 'read'
+                    ELSE 'sent'
+                END AS status
+            FROM sends
+            WHERE gmail_message_id = %s
+            LIMIT 1
+        """, (gmail_message_id, gmail_message_id))
+
     row = cur.fetchone()
     cur.close()
     conn.close()
 
     if not row:
-        print(f"⚠️ No record found for Gmail ID: {gmail_message_id}")
+        print(f"⚠️ No record found for Gmail ID: {gmail_message_id} ({recipient_email})")
         return JSONResponse({"status": "unknown"}, status_code=404)
 
     return JSONResponse({"status": row["status"]})
