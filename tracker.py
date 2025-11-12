@@ -145,23 +145,28 @@ def valid_uuid(value):
         return False
 
 
-# New endpoint: /statuses
-@app.post("/statuses")
-def get_statuses(emails: list[str] = Body(...)):
+@app.get("/status")
+def get_status(gmail_message_id: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT 
-            s.recipient_email,
             CASE 
-                WHEN EXISTS (SELECT 1 FROM events e WHERE e.track_id = s.track_id)
+                WHEN EXISTS (
+                    SELECT 1 FROM events e
+                    JOIN sends s ON e.track_id = s.track_id
+                    WHERE s.gmail_message_id = %s
+                )
                 THEN 'read'
                 ELSE 'sent'
             END AS status
-        FROM sends s
-        WHERE s.recipient_email = ANY(%s)
-    """, (emails,))
-    data = cur.fetchall()
+        FROM sends
+        WHERE gmail_message_id = %s
+        LIMIT 1
+    """, (gmail_message_id, gmail_message_id))
+    row = cur.fetchone()
     cur.close()
     conn.close()
-    return {row["recipient_email"]: row["status"] for row in data}
+    if not row:
+        return {"status": "unknown"}
+    return {"status": row["status"]}
