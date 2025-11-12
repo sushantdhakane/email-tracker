@@ -84,43 +84,47 @@ async def pixel(track_id: str, request: Request):
     if not valid_uuid(track_id):
         raise HTTPException(status_code=404)
 
-    ua = request.headers.get("User-Agent", "").lower()
+    ua = request.headers.get("User-Agent", "")
     ip = request.client.host
     xff = request.headers.get("X-Forwarded-For", "")
     client_ip = xff.split(",")[0].strip() if xff else ip
-
-    ignore_signatures = [
-        "crawler", "fetch", "prefetch", "appengine", "proxy-checker", "headless"
-    ]
-
-    # Check if request is from internal sender or proxy
-    is_internal = (
-        is_internal_ip(client_ip) or
-        "localhost" in ua or
-        "gmail" in ua or
-        "googleimageproxy" in ua
-    )
-    is_bot = any(sig in ua for sig in ignore_signatures)
-
-    if is_bot:
-        print(f"⚠️ Ignored bot/prefetch open from IP {client_ip} with UA '{ua}'")
-        return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
-
-    if is_internal:
-        print(f"⚠️ Ignored internal sender/proxy open from IP {client_ip} with UA '{ua}'")
-        return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+    referer = request.headers.get("Referer", "")
 
     try:
         conn = get_conn()
         cur = conn.cursor()
+
+        # ✅ Check the DB for recipient email associated with the track_id
+        cur.execute("SELECT recipient_email FROM sends WHERE track_id = %s", (track_id,))
+        send_row = cur.fetchone()
+
+        if not send_row:
+            print(f"⚠️ No send record found for track_id: {track_id}")
+            cur.close()
+            conn.close()
+            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+
+        recipient_email = send_row["recipient_email"]
+
+        # ✅ Prevent sender self-opens (check referer or any other sender indication)
+        if recipient_email in referer or "mail.google.com" in referer:
+            print(f"⚠️ Ignored sender/self open for track_id: {track_id}, recipient: {recipient_email}")
+            cur.close()
+            conn.close()
+            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+
+        # ✅ Log genuine recipient open
         cur.execute("""
             INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot)
             VALUES (%s, 'open', %s, %s, FALSE)
+            ON CONFLICT DO NOTHING
         """, (track_id, client_ip, ua))
         conn.commit()
         cur.close()
         conn.close()
-        print(f"✅ Logged genuine open for track_id {track_id} from IP {client_ip} with UA '{ua}'")
+
+        print(f"✅ Logged genuine open for recipient: {recipient_email} (track_id: {track_id})")
+
     except Exception as e:
         print(f"❌ pixel error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
