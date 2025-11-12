@@ -5,6 +5,7 @@ import psycopg2, os, uuid, io
 from psycopg2.extras import RealDictCursor
 from urllib.parse import unquote_plus
 from dotenv import load_dotenv
+import ipaddress
 
 app = FastAPI()
 
@@ -27,6 +28,18 @@ PIXEL_BYTES = bytes.fromhex(
     "1F15C4890000000A49444154789C6360000000020001E221BC33000000"
     "0049454E44AE426082"
 )
+
+def is_internal_ip(ip: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return (
+            ip_obj.is_loopback or
+            ip_obj.is_private or
+            ip_obj.is_reserved or
+            ip_obj.is_link_local
+        )
+    except ValueError:
+        return False
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -74,17 +87,27 @@ async def pixel(track_id: str, request: Request):
     ua = request.headers.get("User-Agent", "").lower()
     ip = request.client.host
     xff = request.headers.get("X-Forwarded-For", "")
+    client_ip = xff.split(",")[0].strip() if xff else ip
 
     ignore_signatures = [
         "crawler", "fetch", "prefetch", "appengine", "proxy-checker", "headless"
     ]
 
-    # ✅ Allow Gmail proxy requests (googleimageproxy) as legitimate opens
-    is_gmail_proxy = "googleimageproxy" in ua
+    # Check if request is from internal sender or proxy
+    is_internal = (
+        is_internal_ip(client_ip) or
+        "localhost" in ua or
+        "gmail" in ua or
+        "googleimageproxy" in ua
+    )
     is_bot = any(sig in ua for sig in ignore_signatures)
 
-    if is_bot and not is_gmail_proxy:
-        print(f"⚠️ Ignored bot/prefetch open from {ip} ({ua})")
+    if is_bot:
+        print(f"⚠️ Ignored bot/prefetch open from IP {client_ip} with UA '{ua}'")
+        return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+
+    if is_internal:
+        print(f"⚠️ Ignored internal sender/proxy open from IP {client_ip} with UA '{ua}'")
         return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
     try:
@@ -93,11 +116,11 @@ async def pixel(track_id: str, request: Request):
         cur.execute("""
             INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot)
             VALUES (%s, 'open', %s, %s, FALSE)
-        """, (track_id, xff or ip, ua))
+        """, (track_id, client_ip, ua))
         conn.commit()
         cur.close()
         conn.close()
-        print(f"✅ Logged open for {track_id} — UA={ua}")
+        print(f"✅ Logged genuine open for track_id {track_id} from IP {client_ip} with UA '{ua}'")
     except Exception as e:
         print(f"❌ pixel error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -128,22 +151,24 @@ def get_status(
     conn = get_conn()
     cur = conn.cursor()
 
-    # Use both identifiers if recipient_email is provided
     if recipient_email:
+        # Check if an open event exists for this message and recipient
         cur.execute("""
             SELECT 
                 CASE 
                     WHEN EXISTS (
                         SELECT 1 FROM events e
                         JOIN sends s ON e.track_id = s.track_id
-                        WHERE s.gmail_message_id = %s AND s.recipient_email = %s
+                        WHERE s.gmail_message_id = %s AND s.recipient_email = %s AND e.event_type = 'open'
                     )
                     THEN 'read'
-                    ELSE 'sent'
+                    WHEN EXISTS (
+                        SELECT 1 FROM sends s
+                        WHERE s.gmail_message_id = %s AND s.recipient_email = %s
+                    )
+                    THEN 'sent'
+                    ELSE 'unknown'
                 END AS status
-            FROM sends
-            WHERE gmail_message_id = %s AND recipient_email = %s
-            LIMIT 1
         """, (gmail_message_id, recipient_email, gmail_message_id, recipient_email))
     else:
         cur.execute("""
@@ -152,22 +177,24 @@ def get_status(
                     WHEN EXISTS (
                         SELECT 1 FROM events e
                         JOIN sends s ON e.track_id = s.track_id
-                        WHERE s.gmail_message_id = %s
+                        WHERE s.gmail_message_id = %s AND e.event_type = 'open'
                     )
                     THEN 'read'
-                    ELSE 'sent'
+                    WHEN EXISTS (
+                        SELECT 1 FROM sends s
+                        WHERE s.gmail_message_id = %s
+                    )
+                    THEN 'sent'
+                    ELSE 'unknown'
                 END AS status
-            FROM sends
-            WHERE gmail_message_id = %s
-            LIMIT 1
         """, (gmail_message_id, gmail_message_id))
 
     row = cur.fetchone()
     cur.close()
     conn.close()
 
-    if not row:
-        print(f"⚠️ No record found for Gmail ID: {gmail_message_id} ({recipient_email})")
+    if not row or row["status"] == "unknown":
+        print(f"⚠️ No send or open record found for Gmail ID: {gmail_message_id} ({recipient_email})")
         return JSONResponse({"status": "unknown"}, status_code=404)
 
     return JSONResponse({"status": row["status"]})
