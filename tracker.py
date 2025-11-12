@@ -73,24 +73,20 @@ async def pixel(track_id: str, request: Request):
 
     ua = request.headers.get("User-Agent", "").lower()
     ip = request.client.host
-    via = request.headers.get("Via", "").lower()
     xff = request.headers.get("X-Forwarded-For", "")
 
-    bot_signatures = [
-        "bot", "crawler", "fetch", "prefetch", "appengine", "proxy", "gmail"
+    ignore_signatures = [
+        "crawler", "fetch", "prefetch", "appengine", "proxy-checker", "headless"
     ]
-    bot_ips = ["64.18.", "74.125.", "209.85.", "172.217."]
 
-    is_google_proxy = "googleimageproxy" in ua
-    has_real_user_ip = bool(xff and not xff.startswith(("66.249.", "127.", "10.", "172.", "192.168")))
+    # ✅ Allow Gmail proxy requests (googleimageproxy) as legitimate opens
+    is_gmail_proxy = "googleimageproxy" in ua
+    is_bot = any(sig in ua for sig in ignore_signatures)
 
-    # Filter prefetch/bots but allow Gmail proxy with real user IP
-    if (any(word in ua for word in bot_signatures) or any(ip.startswith(p) for p in bot_ips)) and not (is_google_proxy and has_real_user_ip):
-        print(f"⚠️ Ignored proxy/bot open from {ip} ({ua}) — via={via}, xff={xff}")
+    if is_bot and not is_gmail_proxy:
+        print(f"⚠️ Ignored bot/prefetch open from {ip} ({ua})")
         return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-    conn = None
-    cur = None
     try:
         conn = get_conn()
         cur = conn.cursor()
@@ -99,15 +95,12 @@ async def pixel(track_id: str, request: Request):
             VALUES (%s, 'open', %s, %s, FALSE)
         """, (track_id, xff or ip, ua))
         conn.commit()
-        print(f"✅ Logged real open for {track_id} from {xff or ip}")
+        cur.close()
+        conn.close()
+        print(f"✅ Logged open for {track_id} — UA={ua}")
     except Exception as e:
-        print("❌ pixel error:", e)
+        print(f"❌ pixel error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
 
     return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
