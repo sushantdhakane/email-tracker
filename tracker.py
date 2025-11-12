@@ -77,13 +77,16 @@ async def pixel(track_id: str, request: Request):
     xff = request.headers.get("X-Forwarded-For", "")
 
     bot_signatures = [
-        "googleimageproxy", "bot", "crawler", "fetch", "prefetch",
-        "appengine", "proxy", "gmail", "google"
+        "bot", "crawler", "fetch", "prefetch", "appengine", "proxy", "gmail"
     ]
-    bot_ips = ["66.249.", "64.18.", "74.125.", "209.85.", "172.217."]
+    bot_ips = ["64.18.", "74.125.", "209.85.", "172.217."]
 
-    if any(word in ua for word in bot_signatures) or any(ip.startswith(p) for p in bot_ips):
-        print(f"⚠️ Ignored proxy/bot open from {ip} ({ua})")
+    is_google_proxy = "googleimageproxy" in ua
+    has_real_user_ip = bool(xff and not xff.startswith(("66.249.", "127.", "10.", "172.", "192.168")))
+
+    # Filter prefetch/bots but allow Gmail proxy with real user IP
+    if (any(word in ua for word in bot_signatures) or any(ip.startswith(p) for p in bot_ips)) and not (is_google_proxy and has_real_user_ip):
+        print(f"⚠️ Ignored proxy/bot open from {ip} ({ua}) — via={via}, xff={xff}")
         return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
     conn = None
@@ -94,10 +97,9 @@ async def pixel(track_id: str, request: Request):
         cur.execute("""
             INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot)
             VALUES (%s, 'open', %s, %s, FALSE)
-        """, (track_id, ip, ua))
+        """, (track_id, xff or ip, ua))
         conn.commit()
-        print(f"✅ Logged real open for {track_id} from {ip}")
-        return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+        print(f"✅ Logged real open for {track_id} from {xff or ip}")
     except Exception as e:
         print("❌ pixel error:", e)
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -106,6 +108,8 @@ async def pixel(track_id: str, request: Request):
             cur.close()
         if conn:
             conn.close()
+
+    return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
 @app.get("/click/{track_id}")
 async def click(track_id: str, url: str):
