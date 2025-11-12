@@ -124,11 +124,11 @@ def get_stats():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT s.recipient_email, s.subject, s.sent_at, COUNT(e.id) AS opens, 
+        SELECT s.recipient_email, s.sent_at, COUNT(e.id) AS opens, 
                MAX(e.opened_at) AS last_open
         FROM sends s
         LEFT JOIN events e ON s.track_id = e.track_id
-        GROUP BY s.recipient_email, s.subject, s.sent_at
+        GROUP BY s.recipient_email, s.sent_at
         ORDER BY s.sent_at DESC;
     """)
     data = cur.fetchall()
@@ -168,5 +168,9 @@ def get_status(gmail_message_id: str):
     cur.close()
     conn.close()
     if not row:
-        return {"status": "unknown"}
-    return {"status": row["status"]}
+        return JSONResponse({"status": "unknown"})
+    return JSONResponse({"status": row["status"]})
+
+@app.get("/status/{gmail_message_id}")
+def get_status_fallback(gmail_message_id: str):
+    return get_status(gmail_message_id)
