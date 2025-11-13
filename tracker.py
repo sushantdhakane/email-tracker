@@ -106,17 +106,35 @@ async def pixel(track_id: str, request: Request):
 
         recipient_email = send_row["recipient_email"]
 
-        # Detect sender opening their own sent mail:
-        if "mail.google.com" in referer and (
-            "in%3Asent" in referer or
-            "/#sent" in referer or
-            "act=sm" in referer
-        ):
+        # ✅ Improved sender detection - check multiple Gmail sent folder patterns
+        referer_lower = referer.lower()
+        is_gmail_referer = "mail.google.com" in referer_lower
+        
+        # More comprehensive sent folder detection
+        sent_folder_indicators = [
+            "in%3Asent",  # URL encoded
+            "in:sent",    # Decoded
+            "/#sent",
+            "#sent",
+            "label/sent",
+            "mail/sent",
+            "act=sm",
+            "view=cm&fs=1",  # Compose view (when reviewing sent)
+            "&sf=sm&",       # Sent folder parameter
+        ]
+        
+        is_sent_folder = any(indicator in referer_lower for indicator in sent_folder_indicators)
+        
+        # Additional check: If it's Gmail AND looks like sent folder, skip
+        if is_gmail_referer and is_sent_folder:
             print(f"⚠️ Ignored sender open (sent folder) for {track_id}")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
+        # ✅ Also check if this might be the sender's IP (optional additional protection)
+        # You could implement IP-based filtering if you track sender IP during email registration
+        
         # ✅ Log genuine recipient open
         cur.execute("""
             INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot)
