@@ -84,11 +84,13 @@ async def pixel(track_id: str, request: Request):
     if not valid_uuid(track_id):
         raise HTTPException(status_code=404)
 
-    ua = request.headers.get("User-Agent", "")
+    ua = request.headers.get("User-Agent", "").lower()
     ip = request.client.host
     xff = request.headers.get("X-Forwarded-For", "")
     client_ip = xff.split(",")[0].strip() if xff else ip
-    referer = request.headers.get("Referer", "")
+    referer = request.headers.get("Referer", "").lower()
+
+    print(f"🔍 Pixel request - Track ID: {track_id}, IP: {client_ip}, Referer: {referer}")
 
     try:
         conn = get_conn()
@@ -106,35 +108,25 @@ async def pixel(track_id: str, request: Request):
 
         recipient_email = send_row["recipient_email"]
 
-        # ✅ Improved sender detection - check multiple Gmail sent folder patterns
-        referer_lower = referer.lower()
-        is_gmail_referer = "mail.google.com" in referer_lower
+        # ✅ VERY STRICT filtering - only count as open if:
+        # 1. Referer is NOT Gmail AND
+        # 2. User-Agent is NOT empty/short AND  
+        # 3. User-Agent does NOT contain bot indicators
         
-        # More comprehensive sent folder detection
-        sent_folder_indicators = [
-            "in%3Asent",  # URL encoded
-            "in:sent",    # Decoded
-            "/#sent",
-            "#sent",
-            "label/sent",
-            "mail/sent",
-            "act=sm",
-            "view=cm&fs=1",  # Compose view (when reviewing sent)
-            "&sf=sm&",       # Sent folder parameter
-        ]
+        is_gmail_referer = "mail.google.com" in referer
+        is_suspicious_ua = not ua or len(ua) < 20
+        is_bot = any(bot in ua for bot in ['bot', 'crawl', 'spider', 'monitoring', 'checker', 'scan'])
         
-        is_sent_folder = any(indicator in referer_lower for indicator in sent_folder_indicators)
-        
-        # Additional check: If it's Gmail AND looks like sent folder, skip
-        if is_gmail_referer and is_sent_folder:
-            print(f"⚠️ Ignored sender open (sent folder) for {track_id}")
+        # Count as genuine ONLY if:
+        # - NOT from Gmail AND
+        # - NOT suspicious user agent AND
+        # - NOT a bot
+        if is_gmail_referer or is_suspicious_ua or is_bot:
+            print(f"⚠️ Ignored non-recipient open - Gmail: {is_gmail_referer}, Suspicious UA: {is_suspicious_ua}, Bot: {is_bot}")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # ✅ Also check if this might be the sender's IP (optional additional protection)
-        # You could implement IP-based filtering if you track sender IP during email registration
-        
         # ✅ Log genuine recipient open
         cur.execute("""
             INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot)
