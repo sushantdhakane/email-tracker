@@ -106,9 +106,13 @@ async def pixel(track_id: str, request: Request):
 
         recipient_email = send_row["recipient_email"]
 
-        # ✅ Prevent sender self-opens (check referer or any other sender indication)
-        if recipient_email in referer or "mail.google.com" in referer:
-            print(f"⚠️ Ignored sender/self open for track_id: {track_id}, recipient: {recipient_email}")
+        # Detect sender opening their own sent mail:
+        if "mail.google.com" in referer and (
+            "in%3Asent" in referer or
+            "/#sent" in referer or
+            "act=sm" in referer
+        ):
+            print(f"⚠️ Ignored sender open (sent folder) for {track_id}")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
@@ -116,9 +120,12 @@ async def pixel(track_id: str, request: Request):
         # ✅ Log genuine recipient open
         cur.execute("""
             INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot)
-            VALUES (%s, 'open', %s, %s, FALSE)
+            SELECT %s, 'open', %s, %s, FALSE
+            WHERE EXISTS (
+                SELECT 1 FROM sends WHERE track_id = %s
+            )
             ON CONFLICT DO NOTHING
-        """, (track_id, client_ip, ua))
+        """, (track_id, client_ip, ua, track_id))
         conn.commit()
         cur.close()
         conn.close()
