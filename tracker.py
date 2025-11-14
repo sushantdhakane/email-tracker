@@ -29,6 +29,49 @@ PIXEL_BYTES = bytes.fromhex(
     "0049454E44AE426082"
 )
 
+import hashlib
+import hmac
+import time
+
+# Add a secret key for HMAC verification
+HMAC_SECRET = os.getenv("HMAC_SECRET", "your-secret-key-here")
+
+def generate_sender_token(sender_email, track_id, timestamp=None):
+    """Generate HMAC token to verify sender identity"""
+    if timestamp is None:
+        timestamp = str(int(time.time()))
+    
+    message = f"{sender_email}:{track_id}:{timestamp}"
+    signature = hmac.new(
+        HMAC_SECRET.encode(), 
+        message.encode(), 
+        hashlib.sha256
+    ).hexdigest()
+    
+    return f"{timestamp}:{signature}"
+
+def verify_sender_token(token, sender_email, track_id, max_age=3600):
+    """Verify HMAC token and check expiration"""
+    try:
+        timestamp_str, signature = token.split(":")
+        timestamp = int(timestamp_str)
+        
+        # Check token expiration
+        if time.time() - timestamp > max_age:
+            return False
+            
+        # Verify signature
+        expected_message = f"{sender_email}:{track_id}:{timestamp_str}"
+        expected_signature = hmac.new(
+            HMAC_SECRET.encode(),
+            expected_message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        return hmac.compare_digest(signature, expected_signature)
+    except:
+        return False
+    
 def is_internal_ip(ip: str) -> bool:
     try:
         ip_obj = ipaddress.ip_address(ip)
@@ -86,7 +129,12 @@ async def register_send(payload: dict):
         conn.close()
 
 @app.get("/pixel/{track_id}.png")
-async def pixel(track_id: str, request: Request):
+async def pixel(
+    track_id: str, 
+    request: Request,
+    sender_token: str = Query(None),
+    sender_email: str = Query(None)
+):
     if not valid_uuid(track_id):
         raise HTTPException(status_code=404)
 
@@ -94,20 +142,20 @@ async def pixel(track_id: str, request: Request):
     ip = request.client.host
     xff = request.headers.get("X-Forwarded-For", "")
     client_ip = xff.split(",")[0].strip() if xff else ip
-    referer = request.headers.get("Referer", "").lower()
-    accept = request.headers.get("Accept", "").lower()
+    referer = request.headers.get("Referer", "").lower()  # This is used below
 
     print(f"🔍 Pixel request - Track ID: {track_id}, IP: {client_ip}")
-    print(f"   Referer: {referer}")
+    print(f"   Sender Token: {sender_token is not None}")
+    print(f"   Sender Email: {sender_email}")
+    print(f"   Referer: {referer}")  # Using referer here
     print(f"   User-Agent: {ua[:100]}...")
-    print(f"   Accept: {accept}")
 
     try:
         conn = get_conn()
         cur = conn.cursor()
 
-        # ✅ Check the DB for recipient email associated with the track_id
-        cur.execute("SELECT recipient_email, gmail_message_id FROM sends WHERE track_id = %s", (track_id,))
+        # ✅ Get send record
+        cur.execute("SELECT recipient_email, sender_email FROM sends WHERE track_id = %s", (track_id,))
         send_row = cur.fetchone()
 
         if not send_row:
@@ -117,78 +165,57 @@ async def pixel(track_id: str, request: Request):
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
         recipient_email = send_row["recipient_email"]
-        gmail_message_id = send_row["gmail_message_id"]
+        stored_sender_email = send_row["sender_email"]
 
-        # ✅ MULTI-LAYERED FILTERING - Only count as genuine if ALL conditions pass
+        # ✅ FIRST: Check if this is the sender opening the email (highest priority)
+        if sender_token and sender_email:
+            is_valid_sender = verify_sender_token(sender_token, sender_email, track_id)
+            if is_valid_sender and sender_email == stored_sender_email:
+                print(f"👤 Ignored sender open: {sender_email}")
+                cur.close()
+                conn.close()
+                return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+
+        # ✅ SECOND: Use referer to detect Gmail sent folder opens (fallback protection)
+        is_gmail_sent_folder = (
+            "mail.google.com" in referer and 
+            any(indicator in referer for indicator in [
+                "in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", 
+                "mail/sent", "sent%20mail", "category=sent", "search=sent"
+            ])
+        )
         
-        # Layer 1: IP-based filtering (check if internal/private IP)
-        if is_internal_ip(client_ip):
-            print(f"⚠️ Ignored internal IP: {client_ip}")
+        if is_gmail_sent_folder:
+            print(f"📬 Ignored Gmail sent folder open: {referer}")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # Layer 2: User-Agent filtering
-        is_suspicious_ua = not ua or len(ua) < 25
-        is_bot = any(bot in ua for bot in [
-            'bot', 'crawl', 'spider', 'monitoring', 'checker', 'scan', 
-            'googlebot', 'bingbot', 'slurp', 'duckduckbot', 'baiduspider',
-            'yandexbot', 'facebookexternalhit'
+        # ✅ THIRD: Block Google proxies and bots
+        is_google_proxy = any(proxy_indicator in ua for proxy_indicator in [
+            'googleimageproxy', 'ggpht.com', 'imageproxy', 'via ggpht.com'
+        ]) or any(proxy_ip in client_ip for proxy_ip in [
+            '66.249.', '64.233.', '72.14.', '74.125.'
         ])
-        is_gmail_app = 'gmail' in ua and ('image-fetch' in ua or 'image-fetching' in ua)
         
-        if is_suspicious_ua or is_bot or is_gmail_app:
-            print(f"⚠️ Ignored suspicious UA - Suspicious: {is_suspicious_ua}, Bot: {is_bot}, Gmail App: {is_gmail_app}")
+        is_suspicious_ua = not ua or len(ua) < 20 or any(suspicious in ua for suspicious in [
+            'bot', 'crawl', 'spider', 'monitoring', 'checker', 'scan'
+        ])
+
+        if is_google_proxy or is_suspicious_ua:
+            print(f"🚫 BLOCKED proxy/bot request")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # Layer 3: Referer-based filtering (STRICT)
-        is_gmail_referer = "mail.google.com" in referer
-        is_empty_referer = not referer or referer == "null"
-        
-        # Comprehensive sent folder detection
-        sent_folder_indicators = [
-            "in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", 
-            "mail/sent", "act=sm", "view=cm&fs=1", "&sf=sm&", "sent%20mail",
-            "category=sent", "search=sent", "qm_sent", "ib_sent"
-        ]
-        
-        is_sent_folder = any(indicator in referer for indicator in sent_folder_indicators)
-        
-        # Also check for Gmail image proxy (common in sent folder opens)
-        is_gmail_image_proxy = "googleusercontent" in referer or "imageproxy" in referer
-        
-        # Layer 4: Accept header filtering (browsers vs email clients)
-        is_browser_accept = 'text/html' in accept or 'application/xhtml+xml' in accept
-        is_email_client = 'image/' in accept and not is_browser_accept
-
-        # ✅ DECISION MATRIX - When to IGNORE the open:
-        ignore_conditions = [
-            # Always ignore if from Gmail sent folder
-            (is_gmail_referer and is_sent_folder),
-            
-            # Always ignore if from Gmail image proxy (sent folder previews)
-            is_gmail_image_proxy,
-            
-            # Ignore if empty referer AND looks like browser (likely sent folder)
-            (is_empty_referer and is_browser_accept),
-            
-            # Ignore if it's clearly the sender's Gmail
-            (is_gmail_referer and not is_email_client),
-        ]
-        
-        if any(ignore_conditions):
-            print(f"⚠️ Ignored non-recipient open:")
-            print(f"   - Gmail+Sent: {is_gmail_referer and is_sent_folder}")
-            print(f"   - Gmail Proxy: {is_gmail_image_proxy}")
-            print(f"   - Empty Ref+Browser: {is_empty_referer and is_browser_accept}")
-            print(f"   - Gmail+Not Email: {is_gmail_referer and not is_email_client}")
+        # ✅ FOURTH: Additional security - block internal IPs
+        if is_internal_ip(client_ip):
+            print(f"🏠 BLOCKED internal IP: {client_ip}")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # Layer 5: Rate limiting by IP (optional but recommended)
+        # ✅ FIFTH: Rate limiting
         cur.execute("""
             SELECT COUNT(*) as recent_opens 
             FROM events 
@@ -196,13 +223,13 @@ async def pixel(track_id: str, request: Request):
         """, (client_ip,))
         recent_opens = cur.fetchone()["recent_opens"]
         
-        if recent_opens > 50:  # More than 50 opens per hour from same IP
-            print(f"⚠️ Rate limited IP: {client_ip} ({recent_opens} opens in last hour)")
+        if recent_opens > 10:
+            print(f"⏱️ RATE LIMITED IP: {client_ip} ({recent_opens} opens in last hour)")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # ✅ If we passed all filters, count as genuine open
+        # ✅ ONLY COUNT AS GENUINE if it passed ALL filters
         cur.execute("""
             INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot)
             VALUES (%s, 'open', %s, %s, FALSE)
@@ -210,11 +237,10 @@ async def pixel(track_id: str, request: Request):
         """, (track_id, client_ip, ua))
         conn.commit()
         
-        print(f"✅ Logged GENUINE open for:")
+        print(f"✅ Logged GENUINE recipient open:")
         print(f"   Recipient: {recipient_email}")
-        print(f"   Gmail ID: {gmail_message_id}")
         print(f"   IP: {client_ip}")
-        print(f"   UA: {ua[:50]}...")
+        print(f"   Referer: {referer}")  # Using referer here too
 
     except Exception as e:
         print(f"❌ pixel error: {e}")
