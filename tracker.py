@@ -36,10 +36,16 @@ def is_internal_ip(ip: str) -> bool:
             ip_obj.is_loopback or
             ip_obj.is_private or
             ip_obj.is_reserved or
-            ip_obj.is_link_local
+            ip_obj.is_link_local or
+            ip_obj.is_multicast or
+            str(ip_obj).startswith('127.') or
+            str(ip_obj).startswith('10.') or
+            str(ip_obj).startswith('192.168.') or
+            (str(ip_obj).startswith('172.') and 16 <= ip_obj.packed[1] <= 31) or
+            str(ip_obj) == '0.0.0.0'
         )
     except ValueError:
-        return False
+        return True  # Treat invalid IPs as internal
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
