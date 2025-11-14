@@ -89,15 +89,19 @@ async def pixel(track_id: str, request: Request):
     xff = request.headers.get("X-Forwarded-For", "")
     client_ip = xff.split(",")[0].strip() if xff else ip
     referer = request.headers.get("Referer", "").lower()
+    accept = request.headers.get("Accept", "").lower()
 
-    print(f"🔍 Pixel request - Track ID: {track_id}, IP: {client_ip}, Referer: {referer}")
+    print(f"🔍 Pixel request - Track ID: {track_id}, IP: {client_ip}")
+    print(f"   Referer: {referer}")
+    print(f"   User-Agent: {ua[:100]}...")
+    print(f"   Accept: {accept}")
 
     try:
         conn = get_conn()
         cur = conn.cursor()
 
         # ✅ Check the DB for recipient email associated with the track_id
-        cur.execute("SELECT recipient_email FROM sends WHERE track_id = %s", (track_id,))
+        cur.execute("SELECT recipient_email, gmail_message_id FROM sends WHERE track_id = %s", (track_id,))
         send_row = cur.fetchone()
 
         if not send_row:
@@ -107,44 +111,111 @@ async def pixel(track_id: str, request: Request):
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
         recipient_email = send_row["recipient_email"]
+        gmail_message_id = send_row["gmail_message_id"]
 
-        # ✅ VERY STRICT filtering - only count as open if:
-        # 1. Referer is NOT Gmail AND
-        # 2. User-Agent is NOT empty/short AND  
-        # 3. User-Agent does NOT contain bot indicators
+        # ✅ MULTI-LAYERED FILTERING - Only count as genuine if ALL conditions pass
         
-        is_gmail_referer = "mail.google.com" in referer
-        is_suspicious_ua = not ua or len(ua) < 20
-        is_bot = any(bot in ua for bot in ['bot', 'crawl', 'spider', 'monitoring', 'checker', 'scan'])
-        
-        # Count as genuine ONLY if:
-        # - NOT from Gmail AND
-        # - NOT suspicious user agent AND
-        # - NOT a bot
-        if is_gmail_referer or is_suspicious_ua or is_bot:
-            print(f"⚠️ Ignored non-recipient open - Gmail: {is_gmail_referer}, Suspicious UA: {is_suspicious_ua}, Bot: {is_bot}")
+        # Layer 1: IP-based filtering (check if internal/private IP)
+        if is_internal_ip(client_ip):
+            print(f"⚠️ Ignored internal IP: {client_ip}")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # ✅ Log genuine recipient open
+        # Layer 2: User-Agent filtering
+        is_suspicious_ua = not ua or len(ua) < 25
+        is_bot = any(bot in ua for bot in [
+            'bot', 'crawl', 'spider', 'monitoring', 'checker', 'scan', 
+            'googlebot', 'bingbot', 'slurp', 'duckduckbot', 'baiduspider',
+            'yandexbot', 'facebookexternalhit'
+        ])
+        is_gmail_app = 'gmail' in ua and ('image-fetch' in ua or 'image-fetching' in ua)
+        
+        if is_suspicious_ua or is_bot or is_gmail_app:
+            print(f"⚠️ Ignored suspicious UA - Suspicious: {is_suspicious_ua}, Bot: {is_bot}, Gmail App: {is_gmail_app}")
+            cur.close()
+            conn.close()
+            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+
+        # Layer 3: Referer-based filtering (STRICT)
+        is_gmail_referer = "mail.google.com" in referer
+        is_empty_referer = not referer or referer == "null"
+        
+        # Comprehensive sent folder detection
+        sent_folder_indicators = [
+            "in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", 
+            "mail/sent", "act=sm", "view=cm&fs=1", "&sf=sm&", "sent%20mail",
+            "category=sent", "search=sent", "qm_sent", "ib_sent"
+        ]
+        
+        is_sent_folder = any(indicator in referer for indicator in sent_folder_indicators)
+        
+        # Also check for Gmail image proxy (common in sent folder opens)
+        is_gmail_image_proxy = "googleusercontent" in referer or "imageproxy" in referer
+        
+        # Layer 4: Accept header filtering (browsers vs email clients)
+        is_browser_accept = 'text/html' in accept or 'application/xhtml+xml' in accept
+        is_email_client = 'image/' in accept and not is_browser_accept
+
+        # ✅ DECISION MATRIX - When to IGNORE the open:
+        ignore_conditions = [
+            # Always ignore if from Gmail sent folder
+            (is_gmail_referer and is_sent_folder),
+            
+            # Always ignore if from Gmail image proxy (sent folder previews)
+            is_gmail_image_proxy,
+            
+            # Ignore if empty referer AND looks like browser (likely sent folder)
+            (is_empty_referer and is_browser_accept),
+            
+            # Ignore if it's clearly the sender's Gmail
+            (is_gmail_referer and not is_email_client),
+        ]
+        
+        if any(ignore_conditions):
+            print(f"⚠️ Ignored non-recipient open:")
+            print(f"   - Gmail+Sent: {is_gmail_referer and is_sent_folder}")
+            print(f"   - Gmail Proxy: {is_gmail_image_proxy}")
+            print(f"   - Empty Ref+Browser: {is_empty_referer and is_browser_accept}")
+            print(f"   - Gmail+Not Email: {is_gmail_referer and not is_email_client}")
+            cur.close()
+            conn.close()
+            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+
+        # Layer 5: Rate limiting by IP (optional but recommended)
+        cur.execute("""
+            SELECT COUNT(*) as recent_opens 
+            FROM events 
+            WHERE ip_address = %s AND event_type = 'open' AND created_at > NOW() - INTERVAL '1 hour'
+        """, (client_ip,))
+        recent_opens = cur.fetchone()["recent_opens"]
+        
+        if recent_opens > 50:  # More than 50 opens per hour from same IP
+            print(f"⚠️ Rate limited IP: {client_ip} ({recent_opens} opens in last hour)")
+            cur.close()
+            conn.close()
+            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+
+        # ✅ If we passed all filters, count as genuine open
         cur.execute("""
             INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot)
-            SELECT %s, 'open', %s, %s, FALSE
-            WHERE EXISTS (
-                SELECT 1 FROM sends WHERE track_id = %s
-            )
+            VALUES (%s, 'open', %s, %s, FALSE)
             ON CONFLICT DO NOTHING
-        """, (track_id, client_ip, ua, track_id))
+        """, (track_id, client_ip, ua))
         conn.commit()
-        cur.close()
-        conn.close()
-
-        print(f"✅ Logged genuine open for recipient: {recipient_email} (track_id: {track_id})")
+        
+        print(f"✅ Logged GENUINE open for:")
+        print(f"   Recipient: {recipient_email}")
+        print(f"   Gmail ID: {gmail_message_id}")
+        print(f"   IP: {client_ip}")
+        print(f"   UA: {ua[:50]}...")
 
     except Exception as e:
         print(f"❌ pixel error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
+    finally:
+        cur.close()
+        conn.close()
 
     return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
