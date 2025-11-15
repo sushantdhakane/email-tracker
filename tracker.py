@@ -106,21 +106,51 @@ async def health():
     return {"status": "ok"}
 
 @app.post("/_register_send")
-async def register_send(payload: dict):
+async def register_send(payload: dict, request: Request):
     try:
+        # Extract sender IP for additional verification
+        sender_ip = request.client.host
+        
+        print(f"📝 Register send payload: {payload}")
+        print(f"📝 Sender IP: {sender_ip}")
+        
         conn = get_conn()
         cur = conn.cursor()
+        
+        # Make sure required fields are present
+        required_fields = ["track_id", "recipient_email"]
+        for field in required_fields:
+            if field not in payload:
+                print(f"❌ Missing required field: {field}")
+                return JSONResponse({"ok": False, "error": f"Missing field: {field}"}, status_code=400)
+        
+        # Use sender_email from payload if provided, otherwise try to detect
+        sender_email = payload.get("sender_email")
+        if not sender_email:
+            # Try to extract from other parts of payload or use a default
+            sender_email = "unknown@sender.com"
+            print("⚠️ No sender_email in payload, using default")
+        
         cur.execute("""
-            INSERT INTO sends (track_id, recipient_email, gmail_message_id)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (track_id) DO NOTHING
+            INSERT INTO sends (track_id, recipient_email, gmail_message_id, sender_email, sender_ip)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (track_id) DO UPDATE SET
+                recipient_email = EXCLUDED.recipient_email,
+                gmail_message_id = EXCLUDED.gmail_message_id,
+                sender_email = EXCLUDED.sender_email,
+                sender_ip = EXCLUDED.sender_ip
         """, (
             payload["track_id"],
             payload["recipient_email"],
             payload.get("gmail_message_id"),
+            sender_email,
+            sender_ip
         ))
         conn.commit()
+        
+        print(f"✅ Registered send: track_id={payload['track_id']}, sender_email={sender_email}")
         return JSONResponse({"ok": True})
+        
     except Exception as e:
         print("❌ register_send error:", e)
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
