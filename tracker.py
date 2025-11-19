@@ -6,6 +6,9 @@ from psycopg2.extras import RealDictCursor
 from urllib.parse import unquote_plus
 from dotenv import load_dotenv
 import ipaddress
+import hashlib
+import hmac
+import time
 
 app = FastAPI()
 
@@ -29,12 +32,8 @@ PIXEL_BYTES = bytes.fromhex(
     "0049454E44AE426082"
 )
 
-import hashlib
-import hmac
-import time
-
 # Add a secret key for HMAC verification
-HMAC_SECRET = os.getenv("HMAC_SECRET", "your-secret-key-here")
+HMAC_SECRET = os.getenv("HMAC_SECRET", "fallback-secret-key-change-this-in-production")
 
 def generate_sender_token(sender_email, track_id, timestamp=None):
     """Generate HMAC token to verify sender identity"""
@@ -172,12 +171,12 @@ async def pixel(
     ip = request.client.host
     xff = request.headers.get("X-Forwarded-For", "")
     client_ip = xff.split(",")[0].strip() if xff else ip
-    referer = request.headers.get("Referer", "").lower()  # This is used below
+    referer = request.headers.get("Referer", "").lower()
 
     print(f"🔍 Pixel request - Track ID: {track_id}, IP: {client_ip}")
     print(f"   Sender Token: {sender_token is not None}")
     print(f"   Sender Email: {sender_email}")
-    print(f"   Referer: {referer}")  # Using referer here
+    print(f"   Referer: {referer}")
     print(f"   User-Agent: {ua[:100]}...")
 
     try:
@@ -197,7 +196,7 @@ async def pixel(
         recipient_email = send_row["recipient_email"]
         stored_sender_email = send_row["sender_email"]
 
-        # ✅ FIRST: Check if this is the sender opening the email (highest priority)
+        # ✅ FIRST: Check if this is the sender opening the email via token
         if sender_token and sender_email:
             is_valid_sender = verify_sender_token(sender_token, sender_email, track_id)
             if is_valid_sender and sender_email == stored_sender_email:
@@ -206,71 +205,63 @@ async def pixel(
                 conn.close()
                 return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # ✅ SECOND: Use referer to detect Gmail sent folder opens (fallback protection)
-        is_gmail_sent_folder = (
-            "mail.google.com" in referer and 
-            any(indicator in referer for indicator in [
-                "in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", 
-                "mail/sent", "sent%20mail", "category=sent", "search=sent"
-            ])
-        )
+        # ✅ SECOND: Check if this is likely the sender opening from Gmail sent folder
+        # Only block if BOTH conditions are true: Gmail referer AND sent folder indicators
+        is_gmail_referer = "mail.google.com" in referer
+        is_sent_folder = any(indicator in referer for indicator in [
+            "in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", 
+            "mail/sent", "sent%20mail", "category=sent", "search=sent",
+            "qm_sent", "ib_sent"
+        ])
         
-        if is_gmail_sent_folder:
-            print(f"📬 Ignored Gmail sent folder open: {referer}")
+        if is_gmail_referer and is_sent_folder:
+            print(f"📬 Ignored Gmail sent folder open")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # ✅ THIRD: Block Google proxies and bots
+        # ✅ THIRD: Detect Google Image Proxy but DON'T block it - instead log it differently
         is_google_proxy = any(proxy_indicator in ua for proxy_indicator in [
             'googleimageproxy', 'ggpht.com', 'imageproxy', 'via ggpht.com'
         ]) or any(proxy_ip in client_ip for proxy_ip in [
             '66.249.', '64.233.', '72.14.', '74.125.'
         ])
         
-        is_suspicious_ua = not ua or len(ua) < 20 or any(suspicious in ua for suspicious in [
+        # Less aggressive bot detection - only obvious bots
+        is_bot = any(bot in ua for bot in [
             'bot', 'crawl', 'spider', 'monitoring', 'checker', 'scan'
         ])
+        
+        # Don't block based on UA length alone - email clients can have short UAs
+        is_suspicious_ua = not ua  # Only block if completely missing UA
 
-        if is_google_proxy or is_suspicious_ua:
-            print(f"🚫 BLOCKED proxy/bot request")
+        # Only block obvious bots, not Google proxies
+        if is_bot or is_suspicious_ua:
+            print(f"🚫 BLOCKED bot request")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # ✅ FOURTH: Additional security - block internal IPs
+        # ✅ FOURTH: Block internal IPs (optional)
         if is_internal_ip(client_ip):
             print(f"🏠 BLOCKED internal IP: {client_ip}")
             cur.close()
             conn.close()
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # ✅ FIFTH: Rate limiting
+        # ✅ FIFTH: Log the open event (both proxy and direct)
+        # Add via_proxy flag to track Google proxy vs direct opens
         cur.execute("""
-            SELECT COUNT(*) as recent_opens 
-            FROM events 
-            WHERE ip_address = %s AND event_type = 'open' AND created_at > NOW() - INTERVAL '1 hour'
-        """, (client_ip,))
-        recent_opens = cur.fetchone()["recent_opens"]
-        
-        if recent_opens > 10:
-            print(f"⏱️ RATE LIMITED IP: {client_ip} ({recent_opens} opens in last hour)")
-            cur.close()
-            conn.close()
-            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
-
-        # ✅ ONLY COUNT AS GENUINE if it passed ALL filters
-        cur.execute("""
-            INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot)
-            VALUES (%s, 'open', %s, %s, FALSE)
+            INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot, via_proxy)
+            VALUES (%s, 'open', %s, %s, FALSE, %s)
             ON CONFLICT DO NOTHING
-        """, (track_id, client_ip, ua))
+        """, (track_id, client_ip, ua, is_google_proxy))
         conn.commit()
         
-        print(f"✅ Logged GENUINE recipient open:")
-        print(f"   Recipient: {recipient_email}")
-        print(f"   IP: {client_ip}")
-        print(f"   Referer: {referer}")  # Using referer here too
+        if is_google_proxy:
+            print(f"✅ Logged proxy open for: {recipient_email}")
+        else:
+            print(f"✅ Logged direct open for: {recipient_email}")
 
     except Exception as e:
         print(f"❌ pixel error: {e}")
