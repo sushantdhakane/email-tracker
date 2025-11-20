@@ -83,6 +83,18 @@ def is_internal_ip(ip: str) -> bool:
         return True
 
 
+def is_google_proxy_request(ua: str) -> bool:
+    # Google proxy detection based on User-Agent
+    # We removed IP-based detection (66., 64., etc.) as it was too broad and blocked real users.
+    return any(p in ua for p in ["googleimageproxy", "ggpht.com", "imageproxy"])
+
+
+def is_gmail_sent_view(referer: str) -> bool:
+    if "mail.google.com" not in referer:
+        return False
+    sent_indicators = ["in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", "mail/sent", "sent%20mail", "qm_sent", "ib_sent"]
+    return any(ind in referer for ind in sent_indicators)
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     print(f"➡️ Incoming request: {request.method} {request.url}")
@@ -206,21 +218,15 @@ async def pixel(
                 print(f"👤 Ignored sender open (valid sender token for {stored_sender_email})")
                 return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
-        # 3) If referer indicates Gmail sent folder and stored_sender_email matches actor, ignore
-        is_gmail_referer = "mail.google.com" in referer
-        sent_indicators = ["in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", "mail/sent", "sent%20mail", "qm_sent", "ib_sent"]
-        is_sent_folder = any(ind in referer for ind in sent_indicators)
-        if is_gmail_referer and is_sent_folder and stored_sender_email:
-            # We double-check remote IP vs stored sender_ip if available (some clients keep same IP)
-            if stored_sender_ip and stored_sender_ip == client_ip:
-                print(f"📬 Ignored Gmail sent folder open (ip match): {client_ip}")
-                return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
-            # If IP mismatch, still ignore because referer strongly indicates sender viewing Sent
+        # 3) If referer indicates Gmail sent folder, ignore
+        # We ignore ALL opens from Gmail sent folder, as they are likely the sender checking their sent items
+        # or the recipient checking their reply (which implies they already read it).
+        if is_gmail_sent_view(referer):
             print(f"📬 Ignored Gmail sent folder open (referer indicates sent)")
             return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
 
         # 4) Detect Google proxy
-        is_google_proxy = any(p in ua for p in ["googleimageproxy", "ggpht.com", "imageproxy"]) or client_ip.startswith("66.") or client_ip.startswith("72.") or client_ip.startswith("64.") or client_ip.startswith("74.")
+        is_google_proxy = is_google_proxy_request(ua)
 
         # 5) Basic bot detection (only obvious bots)
         is_bot = any(b in ua for b in ["bot", "crawl", "spider", "monitoring", "checker", "scan"]) or ua == ""
