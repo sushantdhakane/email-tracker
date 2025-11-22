@@ -137,25 +137,28 @@ async def register_send(payload: dict, request: Request):
 
         # allow optional sender_email
         sender_email = payload.get("sender_email")
+        gmail_thread_id = payload.get("gmail_thread_id")
 
         cur.execute("""
-            INSERT INTO sends (track_id, recipient_email, gmail_message_id, sender_email, sender_ip)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO sends (track_id, recipient_email, gmail_message_id, gmail_thread_id, sender_email, sender_ip)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (track_id) DO UPDATE SET
                 recipient_email = EXCLUDED.recipient_email,
                 gmail_message_id = EXCLUDED.gmail_message_id,
+                gmail_thread_id = EXCLUDED.gmail_thread_id,
                 sender_email = COALESCE(EXCLUDED.sender_email, sends.sender_email),
                 sender_ip = COALESCE(EXCLUDED.sender_ip, sends.sender_ip)
         """, (
             payload["track_id"],
             payload["recipient_email"],
             payload.get("gmail_message_id"),
+            gmail_thread_id,
             sender_email,
             sender_ip
         ))
         conn.commit()
 
-        print(f"✅ Registered send: track_id={payload['track_id']}, sender_email={sender_email}")
+        print(f"✅ Registered send: track_id={payload['track_id']}, sender_email={sender_email}, thread_id={gmail_thread_id}")
         return JSONResponse({"ok": True})
 
     except Exception as e:
@@ -320,45 +323,52 @@ def get_status(
     #  - there exist at least 2 proxy open events (via_proxy = TRUE) for that track_id
     # The SQL below checks for that condition and otherwise returns 'sent' when send exists.
 
+    # Updated to check both gmail_message_id AND gmail_thread_id
     if recipient_email:
         cur.execute("""
             SELECT CASE
                 WHEN EXISTS (
                     SELECT 1 FROM events e
                     JOIN sends s ON e.track_id = s.track_id
-                    WHERE s.gmail_message_id = %s
+                    WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s)
                       AND s.recipient_email = %s
                       AND e.event_type = 'open'
                       AND e.via_proxy = FALSE
                 ) THEN 'read'
                 WHEN (SELECT COUNT(*) FROM events e2 JOIN sends s2 ON e2.track_id = s2.track_id
-                      WHERE s2.gmail_message_id = %s AND s2.recipient_email = %s AND e2.event_type = 'open' AND e2.via_proxy = TRUE) >= 2
+                      WHERE (s2.gmail_message_id = %s OR s2.gmail_thread_id = %s) 
+                      AND s2.recipient_email = %s AND e2.event_type = 'open' AND e2.via_proxy = TRUE) >= 2
                   THEN 'read'
                 WHEN EXISTS (
-                    SELECT 1 FROM sends s WHERE s.gmail_message_id = %s AND s.recipient_email = %s
+                    SELECT 1 FROM sends s WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s) AND s.recipient_email = %s
                 ) THEN 'sent'
                 ELSE 'unknown'
             END AS status
-        """, (gmail_message_id, recipient_email, gmail_message_id, recipient_email, gmail_message_id, recipient_email))
+        """, (gmail_message_id, gmail_message_id, recipient_email, 
+              gmail_message_id, gmail_message_id, recipient_email, 
+              gmail_message_id, gmail_message_id, recipient_email))
     else:
         cur.execute("""
             SELECT CASE
                 WHEN EXISTS (
                     SELECT 1 FROM events e
                     JOIN sends s ON e.track_id = s.track_id
-                    WHERE s.gmail_message_id = %s
+                    WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s)
                       AND e.event_type = 'open'
                       AND e.via_proxy = FALSE
                 ) THEN 'read'
                 WHEN (SELECT COUNT(*) FROM events e2 JOIN sends s2 ON e2.track_id = s2.track_id
-                      WHERE s2.gmail_message_id = %s AND e2.event_type = 'open' AND e2.via_proxy = TRUE) >= 2
+                      WHERE (s2.gmail_message_id = %s OR s2.gmail_thread_id = %s) 
+                      AND e2.event_type = 'open' AND e2.via_proxy = TRUE) >= 2
                   THEN 'read'
                 WHEN EXISTS (
-                    SELECT 1 FROM sends s WHERE s.gmail_message_id = %s
+                    SELECT 1 FROM sends s WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s)
                 ) THEN 'sent'
                 ELSE 'unknown'
             END AS status
-        """, (gmail_message_id, gmail_message_id, gmail_message_id))
+        """, (gmail_message_id, gmail_message_id, 
+              gmail_message_id, gmail_message_id, 
+              gmail_message_id, gmail_message_id))
 
     row = cur.fetchone()
     cur.close()
