@@ -9,6 +9,7 @@ import ipaddress
 import hashlib
 import hmac
 import time
+import datetime
 
 app = FastAPI()
 
@@ -85,9 +86,17 @@ def is_internal_ip(ip: str) -> bool:
 
 def is_google_proxy_request(ua: str) -> bool:
     # Google proxy detection based on User-Agent
-    # We removed IP-based detection (66., 64., etc.) as it was too broad and blocked real users.
     return any(p in ua for p in ["googleimageproxy", "ggpht.com", "imageproxy"])
 
+def is_google_scanner_ip(ip: str) -> bool:
+    # Known Google scanner IP ranges
+    # 72.14.x.x, 64.233.x.x, 66.102.x.x, 74.125.x.x, 209.85.x.x
+    if ip.startswith("72.14."): return True
+    if ip.startswith("64.233."): return True
+    if ip.startswith("66.102."): return True
+    if ip.startswith("74.125."): return True
+    if ip.startswith("209.85."): return True
+    return False
 
 def is_gmail_sent_view(referer: str) -> bool:
     if "mail.google.com" not in referer:
@@ -123,7 +132,7 @@ async def register_send(payload: dict, request: Request):
     try:
         sender_ip = request.client.host
         print(f"📝 Register send payload: {payload}")
-        print(f"📝 Sender IP: {sender_ip}")
+        print(f"�� Sender IP: {sender_ip}")
 
         # required fields: track_id + recipient_email
         required_fields = ["track_id", "recipient_email"]
@@ -195,101 +204,109 @@ async def pixel(
 
     conn = None
     cur = None
+    
+    # Prepare response with Cache Busting headers
+    response = StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+
     try:
         conn = get_conn()
         cur = conn.cursor()
 
         # fetch the send info
-        cur.execute("SELECT track_id, recipient_email, sender_email, sender_ip FROM sends WHERE track_id = %s", (track_id,))
+        cur.execute("SELECT track_id, recipient_email, sender_email, sender_ip, created_at FROM sends WHERE track_id = %s", (track_id,))
         send_row = cur.fetchone()
         if not send_row:
             print(f"⚠️ No send record found for track_id: {track_id}")
-            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+            return response
 
         recipient_email = send_row["recipient_email"]
         stored_sender_email = send_row.get("sender_email")
         stored_sender_ip = send_row.get("sender_ip")
+        send_time = send_row.get("created_at")
 
         # 1) If sender_email query param provided and equals stored sender => ignore
         if sender_email and stored_sender_email and sender_email.lower() == stored_sender_email.lower():
             print(f"👤 Ignored sender open (query param matched stored sender): {sender_email}")
-            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+            return response
 
         # 2) If sender_token provided, verify HMAC against stored sender
         if sender_token and stored_sender_email:
             if verify_sender_token(sender_token, stored_sender_email, track_id):
                 print(f"👤 Ignored sender open (valid sender token for {stored_sender_email})")
-                return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+                return response
 
         # 3) If referer indicates Gmail sent folder, ignore
-        # We ignore ALL opens from Gmail sent folder, as they are likely the sender checking their sent items
-        # or the recipient checking their reply (which implies they already read it).
         if is_gmail_sent_view(referer):
             print(f"📬 Ignored Gmail sent folder open (referer indicates sent)")
-            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+            return response
 
         # 4) Detect Google proxy
         is_google_proxy = is_google_proxy_request(ua)
+        is_google_scanner = is_google_scanner_ip(client_ip)
 
         # 5) Basic bot detection (only obvious bots)
         is_bot = any(b in ua for b in ["bot", "crawl", "spider", "monitoring", "checker", "scan"]) or ua == ""
+        
+        # 6) Time-Window Filtering (Ghost Open Fix)
+        # If request is within 4 seconds of send time, mark as bot
+        if send_time:
+            # Ensure send_time is timezone aware or naive as needed. 
+            # Postgres returns timezone aware if column is TIMESTAMPTZ.
+            now = datetime.datetime.now(datetime.timezone.utc)
+            # If send_time is naive, assume UTC (or match DB setting)
+            if send_time.tzinfo is None:
+                send_time = send_time.replace(tzinfo=datetime.timezone.utc)
+            
+            time_diff = (now - send_time).total_seconds()
+            print(f"⏱️ Time since send: {time_diff:.2f}s")
+            
+            if time_diff < 4.0:
+                print(f"👻 Ghost Open detected (within 4s): marking as bot")
+                is_bot = True
 
-        # Block only obvious bots or internal IPs
-        if is_bot:
-            print(f"🚫 BLOCKED bot request: UA={ua}")
-            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+        # Mark scanners as bots
+        if is_google_scanner:
+            print(f"🤖 Google Scanner IP detected: {client_ip}")
+            is_bot = True
 
+        # Block only obvious bots or internal IPs (if not marked as bot by our logic above, which we want to log)
+        # Actually, we want to LOG the bot event so we can see it in DB, but mark is_bot=True
+        # We only BLOCK (return early without logging) if it's an internal IP or something we don't want to track at all.
         if is_internal_ip(client_ip):
             print(f"🏠 BLOCKED internal IP: {client_ip}")
-            return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+            return response
 
-        # 6) Google proxy handling: ignore the *first* proxy prefetch, treat subsequent proxy fetches as real opens
+        # 7) Google proxy handling
         via_proxy = is_google_proxy
-        proxy_count = 0
-        cur.execute("SELECT COUNT(*) AS c FROM events WHERE track_id = %s AND via_proxy = TRUE", (track_id,))
-        rc = cur.fetchone()
-        if rc:
-            proxy_count = rc["c"] if "c" in rc else rc[0]
-
-        should_count_as_open = False
-        if via_proxy:
-            # If we have seen previous proxy fetch, treat this as a real open (user viewed after proxy)
-            if proxy_count >= 1:
-                should_count_as_open = True
-            else:
-                # first proxy fetch: log it but do not mark as confirmed open
-                should_count_as_open = False
-        else:
-            # direct fetch from recipient's client counts
-            should_count_as_open = True
-
-        # 7) Insert event (we always record the fetch but mark via_proxy)
+        
+        # 8) Insert event
         cur.execute(
             "INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot, via_proxy) VALUES (%s, 'open', %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-            (track_id, client_ip, ua, False, via_proxy)
+            (track_id, client_ip, ua, is_bot, via_proxy)
         )
         conn.commit()
 
-        if via_proxy:
-            print(f"✅ Logged proxy open for: {recipient_email} (count_before={proxy_count})")
+        if is_bot:
+             print(f"🤖 Logged BOT open for: {recipient_email}")
+        elif via_proxy:
+            print(f"✅ Logged proxy open for: {recipient_email}")
         else:
             print(f"✅ Logged direct open for: {recipient_email}")
 
-        # 8) If this should be counted as confirmed open (non-proxy or subsequent proxy), ensure only one "confirmed" open exists
-        if should_count_as_open:
-            # We don't need a separate flag; existence of any open (direct) or multiple proxy entries will be considered by /status
-            pass
-
     except Exception as e:
         print(f"❌ pixel error: {e}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        # Don't raise 500, just return the image so we don't break the email client
+        return response
     finally:
         if cur:
             cur.close()
         if conn:
             conn.close()
 
-    return StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+    return response
 
 
 @app.get("/click/{track_id}")
@@ -318,9 +335,9 @@ def get_status(
     cur = conn.cursor()
 
     # We consider a message 'read' if:
-    #  - there exists a direct open event (via_proxy = FALSE)
+    #  - there exists a direct open event (via_proxy = FALSE) AND is_bot = FALSE
     #  OR
-    #  - there exist at least 2 proxy open events (via_proxy = TRUE) for that track_id
+    #  - there exist at least 2 proxy open events (via_proxy = TRUE) AND is_bot = FALSE
     # The SQL below checks for that condition and otherwise returns 'sent' when send exists.
 
     # Updated to check both gmail_message_id AND gmail_thread_id
@@ -334,10 +351,11 @@ def get_status(
                       AND s.recipient_email = %s
                       AND e.event_type = 'open'
                       AND e.via_proxy = FALSE
+                      AND e.is_bot = FALSE
                 ) THEN 'read'
                 WHEN (SELECT COUNT(*) FROM events e2 JOIN sends s2 ON e2.track_id = s2.track_id
                       WHERE (s2.gmail_message_id = %s OR s2.gmail_thread_id = %s) 
-                      AND s2.recipient_email = %s AND e2.event_type = 'open' AND e2.via_proxy = TRUE) >= 2
+                      AND s2.recipient_email = %s AND e2.event_type = 'open' AND e2.via_proxy = TRUE AND e2.is_bot = FALSE) >= 2
                   THEN 'read'
                 WHEN EXISTS (
                     SELECT 1 FROM sends s WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s) AND s.recipient_email = %s
@@ -356,10 +374,11 @@ def get_status(
                     WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s)
                       AND e.event_type = 'open'
                       AND e.via_proxy = FALSE
+                      AND e.is_bot = FALSE
                 ) THEN 'read'
                 WHEN (SELECT COUNT(*) FROM events e2 JOIN sends s2 ON e2.track_id = s2.track_id
                       WHERE (s2.gmail_message_id = %s OR s2.gmail_thread_id = %s) 
-                      AND e2.event_type = 'open' AND e2.via_proxy = TRUE) >= 2
+                      AND e2.event_type = 'open' AND e2.via_proxy = TRUE AND e2.is_bot = FALSE) >= 2
                   THEN 'read'
                 WHEN EXISTS (
                     SELECT 1 FROM sends s WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s)
