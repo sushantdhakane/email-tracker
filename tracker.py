@@ -199,6 +199,10 @@ async def pixel(
     print(f"   Referer: {referer}")
     print(f"   User-Agent: {ua[:120]}...")
 
+    # DEBUG: Log if we suspect a sent folder view but it's not caught
+    if "mail.google.com" in referer and not is_gmail_sent_view(referer):
+        print(f"⚠️ Potential MISSED Sent Folder view? Referer: {referer}")
+
     conn = None
     cur = None
     
