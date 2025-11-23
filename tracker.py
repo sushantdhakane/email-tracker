@@ -86,7 +86,7 @@ def is_internal_ip(ip: str) -> bool:
 
 def is_google_proxy_request(ua: str) -> bool:
     # Google proxy detection based on User-Agent
-    return any(p in ua for p in ["googleimageproxy", "ggpht.com", "imageproxy"])
+    return any(p in ua for p in ["imageproxy"])
 
 def is_google_scanner_ip(ip: str) -> bool:
     # Known Google scanner IP ranges
@@ -101,7 +101,7 @@ def is_google_scanner_ip(ip: str) -> bool:
 def is_gmail_sent_view(referer: str) -> bool:
     if "mail.google.com" not in referer:
         return False
-    sent_indicators = ["in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", "mail/sent", "sent%20mail", "qm_sent", "ib_sent"]
+    sent_indicators = ["in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", "mail/sent", "sent%20mail", "qm_sent", "ib_sent","/u/2/#sent"]
     return any(ind in referer for ind in sent_indicators)
 
 @app.middleware("http")
