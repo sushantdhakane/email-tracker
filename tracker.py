@@ -86,22 +86,19 @@ def is_internal_ip(ip: str) -> bool:
 
 def is_google_proxy_request(ua: str) -> bool:
     # Google proxy detection based on User-Agent
-    return any(p in ua for p in ["imageproxy"])
+    return any(p in ua for p in ["googleimageproxy", "ggpht.com", "imageproxy"])
 
 def is_google_scanner_ip(ip: str) -> bool:
     # Known Google scanner IP ranges
     # 72.14.x.x - Scanner
-    # 66.249.x.x - Googlebot/Crawler (often masquerades as proxy but is a bot)
+    # Removed 66.249.x.x as it is used for real mobile opens
     if ip.startswith("72.14."): return True
-    if ip.startswith("66.249."): return True
-    # Note: 66.102.x.x and 74.125.x.x are standard Image Proxy IPs, we should NOT block them by default
-    # unless we are sure. The user only reported 72.14 and 66.249 as problematic.
     return False
 
 def is_gmail_sent_view(referer: str) -> bool:
     if "mail.google.com" not in referer:
         return False
-    sent_indicators = ["in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", "mail/sent", "sent%20mail", "qm_sent", "ib_sent","/u/2/#sent"]
+    sent_indicators = ["in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", "mail/sent", "sent%20mail", "qm_sent", "ib_sent"]
     return any(ind in referer for ind in sent_indicators)
 
 @app.middleware("http")
@@ -331,8 +328,8 @@ def get_status(
     # We consider a message 'read' if:
     #  - there exists a direct open event (via_proxy = FALSE) AND is_bot = FALSE
     #  OR
-    #  - there exist at least 2 proxy open events (via_proxy = TRUE) AND is_bot = FALSE
-    # The SQL below checks for that condition and otherwise returns 'sent' when send exists.
+    #  - there exist at least 1 proxy open event (via_proxy = TRUE) AND is_bot = FALSE
+    #    (Changed from 2 to 1 because we now filter bots via time-window)
 
     if recipient_email:
         cur.execute("""
@@ -348,8 +345,8 @@ def get_status(
                 ) THEN 'read'
                 WHEN (SELECT COUNT(*) FROM events e2 JOIN sends s2 ON e2.track_id = s2.track_id
                       WHERE (s2.gmail_message_id = %s OR s2.gmail_thread_id = %s) 
-                      AND s2.recipient_email = %s AND e2.event_type = 'open' AND e2.via_proxy = TRUE AND e2.is_bot = FALSE) >= 2
-                  THEN 'sent'
+                      AND s2.recipient_email = %s AND e2.event_type = 'open' AND e2.via_proxy = TRUE AND e2.is_bot = FALSE) >= 1
+                  THEN 'read'
                 WHEN EXISTS (
                     SELECT 1 FROM sends s WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s) AND s.recipient_email = %s
                 ) THEN 'sent'
@@ -371,8 +368,8 @@ def get_status(
                 ) THEN 'read'
                 WHEN (SELECT COUNT(*) FROM events e2 JOIN sends s2 ON e2.track_id = s2.track_id
                       WHERE (s2.gmail_message_id = %s OR s2.gmail_thread_id = %s) 
-                      AND e2.event_type = 'open' AND e2.via_proxy = TRUE AND e2.is_bot = FALSE) >= 2
-                  THEN 'sent'
+                      AND e2.event_type = 'open' AND e2.via_proxy = TRUE AND e2.is_bot = FALSE) >= 1
+                  THEN 'read'
                 WHEN EXISTS (
                     SELECT 1 FROM sends s WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s)
                 ) THEN 'sent'
