@@ -90,12 +90,12 @@ def is_google_proxy_request(ua: str) -> bool:
 
 def is_google_scanner_ip(ip: str) -> bool:
     # Known Google scanner IP ranges
-    # 72.14.x.x, 64.233.x.x, 66.102.x.x, 74.125.x.x, 209.85.x.x
+    # 72.14.x.x - Scanner
+    # 66.249.x.x - Googlebot/Crawler (often masquerades as proxy but is a bot)
     if ip.startswith("72.14."): return True
-    if ip.startswith("64.233."): return True
-    if ip.startswith("66.102."): return True
-    if ip.startswith("74.125."): return True
-    if ip.startswith("209.85."): return True
+    if ip.startswith("66.249."): return True
+    # Note: 66.102.x.x and 74.125.x.x are standard Image Proxy IPs, we should NOT block them by default
+    # unless we are sure. The user only reported 72.14 and 66.249 as problematic.
     return False
 
 def is_gmail_sent_view(referer: str) -> bool:
@@ -132,7 +132,7 @@ async def register_send(payload: dict, request: Request):
     try:
         sender_ip = request.client.host
         print(f"📝 Register send payload: {payload}")
-        print(f"�� Sender IP: {sender_ip}")
+        print(f"📝 Sender IP: {sender_ip}")
 
         # required fields: track_id + recipient_email
         required_fields = ["track_id", "recipient_email"]
@@ -251,20 +251,17 @@ async def pixel(
         is_bot = any(b in ua for b in ["bot", "crawl", "spider", "monitoring", "checker", "scan"]) or ua == ""
         
         # 6) Time-Window Filtering (Ghost Open Fix)
-        # If request is within 4 seconds of send time, mark as bot
+        # If request is within 5 seconds of send time, mark as bot
         if send_time:
-            # Ensure send_time is timezone aware or naive as needed. 
-            # Postgres returns timezone aware if column is TIMESTAMPTZ.
             now = datetime.datetime.now(datetime.timezone.utc)
-            # If send_time is naive, assume UTC (or match DB setting)
             if send_time.tzinfo is None:
                 send_time = send_time.replace(tzinfo=datetime.timezone.utc)
             
             time_diff = (now - send_time).total_seconds()
             print(f"⏱️ Time since send: {time_diff:.2f}s")
             
-            if time_diff < 4.0:
-                print(f"👻 Ghost Open detected (within 4s): marking as bot")
+            if time_diff < 5.0:
+                print(f"👻 Ghost Open detected (within 5s): marking as bot")
                 is_bot = True
 
         # Mark scanners as bots
@@ -272,9 +269,7 @@ async def pixel(
             print(f"🤖 Google Scanner IP detected: {client_ip}")
             is_bot = True
 
-        # Block only obvious bots or internal IPs (if not marked as bot by our logic above, which we want to log)
-        # Actually, we want to LOG the bot event so we can see it in DB, but mark is_bot=True
-        # We only BLOCK (return early without logging) if it's an internal IP or something we don't want to track at all.
+        # Block only obvious bots or internal IPs
         if is_internal_ip(client_ip):
             print(f"🏠 BLOCKED internal IP: {client_ip}")
             return response
@@ -298,7 +293,6 @@ async def pixel(
 
     except Exception as e:
         print(f"❌ pixel error: {e}")
-        # Don't raise 500, just return the image so we don't break the email client
         return response
     finally:
         if cur:
@@ -340,7 +334,6 @@ def get_status(
     #  - there exist at least 2 proxy open events (via_proxy = TRUE) AND is_bot = FALSE
     # The SQL below checks for that condition and otherwise returns 'sent' when send exists.
 
-    # Updated to check both gmail_message_id AND gmail_thread_id
     if recipient_email:
         cur.execute("""
             SELECT CASE
@@ -356,7 +349,7 @@ def get_status(
                 WHEN (SELECT COUNT(*) FROM events e2 JOIN sends s2 ON e2.track_id = s2.track_id
                       WHERE (s2.gmail_message_id = %s OR s2.gmail_thread_id = %s) 
                       AND s2.recipient_email = %s AND e2.event_type = 'open' AND e2.via_proxy = TRUE AND e2.is_bot = FALSE) >= 2
-                  THEN 'read'
+                  THEN 'sent'
                 WHEN EXISTS (
                     SELECT 1 FROM sends s WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s) AND s.recipient_email = %s
                 ) THEN 'sent'
@@ -379,7 +372,7 @@ def get_status(
                 WHEN (SELECT COUNT(*) FROM events e2 JOIN sends s2 ON e2.track_id = s2.track_id
                       WHERE (s2.gmail_message_id = %s OR s2.gmail_thread_id = %s) 
                       AND e2.event_type = 'open' AND e2.via_proxy = TRUE AND e2.is_bot = FALSE) >= 2
-                  THEN 'read'
+                  THEN 'sent'
                 WHEN EXISTS (
                     SELECT 1 FROM sends s WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s)
                 ) THEN 'sent'
