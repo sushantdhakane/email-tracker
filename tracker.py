@@ -277,66 +277,6 @@ async def pixel(
         if conn: conn.close()
 
     return response
-        # 4) Detect Google proxy
-        is_google_proxy = is_google_proxy_request(ua)
-        is_google_scanner = is_google_scanner_ip(client_ip)
-
-        # 5) Basic bot detection (only obvious bots)
-        is_bot = any(b in ua for b in ["bot", "crawl", "spider", "monitoring", "checker", "scan"]) or ua == ""
-        
-        # 6) Time-Window Filtering (Ghost Open Fix)
-        # If request is within 5 seconds of send time, mark as bot
-        if send_time:
-            now = datetime.datetime.now(datetime.timezone.utc)
-            if send_time.tzinfo is None:
-                send_time = send_time.replace(tzinfo=datetime.timezone.utc)
-            
-            time_diff = (now - send_time).total_seconds()
-            print(f"⏱️ Time since send: {time_diff:.2f}s")
-            
-            if time_diff < 5.0:
-                print(f"👻 Ghost Open detected (within 5s): marking as bot")
-                is_bot = True
-
-        # Mark scanners as bots
-        if is_google_scanner:
-            print(f"🤖 Google Scanner IP detected: {client_ip}")
-            is_bot = True
-
-        # Block only obvious bots or internal IPs
-        if is_internal_ip(client_ip):
-            print(f"🏠 BLOCKED internal IP: {client_ip}")
-            return response
-
-        # 7) Google proxy handling
-        via_proxy = is_google_proxy
-        
-        # 8) Insert event
-        cur.execute(
-            "INSERT INTO events (track_id, event_type, ip_address, user_agent, is_bot, via_proxy) VALUES (%s, 'open', %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-            (track_id, client_ip, ua, is_bot, via_proxy)
-        )
-        conn.commit()
-
-        if is_bot:
-             print(f"🤖 Logged BOT open for: {recipient_email}")
-        elif via_proxy:
-            print(f"✅ Logged proxy open for: {recipient_email}")
-        else:
-            print(f"✅ Logged direct open for: {recipient_email}")
-
-    except Exception as e:
-        print(f"❌ pixel error: {e}")
-        return response
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
-
-    return response
-
-
 @app.get("/click/{track_id}")
 async def click(track_id: str, url: str):
     if not valid_uuid(track_id):
