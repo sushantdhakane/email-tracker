@@ -1,3 +1,5 @@
+import requests
+from user_agents import parse
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -141,34 +143,36 @@ async def register_send(payload: dict, request: Request):
         conn = get_conn()
         cur = conn.cursor()
 
-        # allow optional sender_email
+        # allow optional sender_email and subject
         sender_email = payload.get("sender_email")
+        subject = payload.get("subject")
         gmail_thread_id = payload.get("gmail_thread_id")
 
         cur.execute("""
-            INSERT INTO sends (track_id, recipient_email, gmail_message_id, gmail_thread_id, sender_email, sender_ip)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO sends (track_id, recipient_email, gmail_message_id, gmail_thread_id, sender_email, sender_ip, subject)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (track_id) DO UPDATE SET
                 recipient_email = EXCLUDED.recipient_email,
                 gmail_message_id = EXCLUDED.gmail_message_id,
                 gmail_thread_id = EXCLUDED.gmail_thread_id,
                 sender_email = COALESCE(EXCLUDED.sender_email, sends.sender_email),
-                sender_ip = COALESCE(EXCLUDED.sender_ip, sends.sender_ip)
+                sender_ip = COALESCE(EXCLUDED.sender_ip, sends.sender_ip),
+                subject = COALESCE(EXCLUDED.subject, sends.subject)
         """, (
             payload["track_id"],
             payload["recipient_email"],
             payload.get("gmail_message_id"),
             gmail_thread_id,
             sender_email,
-            sender_ip
+            sender_ip,
+            subject
         ))
         conn.commit()
-
-        print(f"✅ Registered send: track_id={payload['track_id']}, sender_email={sender_email}, thread_id={gmail_thread_id}")
-        return JSONResponse({"ok": True})
+        print(f"✅ Registered send for {payload['recipient_email']} (Subject: {subject})")
+        return JSONResponse({"ok": True, "track_id": payload["track_id"]})
 
     except Exception as e:
-        print("❌ register_send error:", e)
+        print(f"❌ register_send error: {e}")
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     finally:
         if cur:
@@ -187,63 +191,92 @@ async def pixel(
     if not valid_uuid(track_id):
         raise HTTPException(status_code=404)
 
-    ua = (request.headers.get("User-Agent") or "").lower()
+    # 1. Capture Request Data
+    ua_string = (request.headers.get("User-Agent") or "").lower()
     ip = request.client.host
     xff = request.headers.get("X-Forwarded-For", "")
     client_ip = xff.split(",")[0].strip() if xff else ip
     referer = (request.headers.get("Referer") or "").lower()
 
+    # 2. Parse User-Agent (OS, Browser, Device)
+    try:
+        ua_parsed = parse(request.headers.get("User-Agent", ""))
+        os_name = ua_parsed.os.family
+        browser_name = ua_parsed.browser.family
+        device_name = ua_parsed.device.family
+    except Exception:
+        os_name, browser_name, device_name = "Unknown", "Unknown", "Unknown"
+
+    # 3. Resolve Location (Country, City)
+    country, city = get_location(client_ip)
+
+    # 4. Bot / Proxy Detection
+    is_bot = is_google_scanner_ip(client_ip) or "bot" in ua_string
+    via_proxy = is_google_proxy_request(ua_string)
+
     print(f"🔍 Pixel request - Track ID: {track_id}, IP: {client_ip}")
-    print(f"   Sender Token: {sender_token is not None}")
-    print(f"   Sender Email param: {sender_email}")
-    print(f"   Referer: {referer}")
-    print(f"   User-Agent: {ua[:120]}...")
+    print(f"   Location: {city}, {country} | OS: {os_name} | Browser: {browser_name}")
 
-    # DEBUG: Log if we suspect a sent folder view but it's not caught
-    if "mail.google.com" in referer and not is_gmail_sent_view(referer):
-        print(f"⚠️ Potential MISSED Sent Folder view? Referer: {referer}")
-
-    conn = None
-    cur = None
-    
-    # Prepare response with Cache Busting headers
+    # Prepare response
     response = StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
 
+    conn = None
+    cur = None
     try:
         conn = get_conn()
         cur = conn.cursor()
 
-        # fetch the send info
+        # Fetch send info
         cur.execute("SELECT track_id, recipient_email, sender_email, sender_ip, created_at FROM sends WHERE track_id = %s", (track_id,))
         send_row = cur.fetchone()
         if not send_row:
             print(f"⚠️ No send record found for track_id: {track_id}")
             return response
 
-        recipient_email = send_row["recipient_email"]
         stored_sender_email = send_row.get("sender_email")
-        stored_sender_ip = send_row.get("sender_ip")
-        send_time = send_row.get("created_at")
 
-        # 1) If sender_email query param provided and equals stored sender => ignore
+        # --- Sender Filtering Logic ---
+        # 1) Query param match
         if sender_email and stored_sender_email and sender_email.lower() == stored_sender_email.lower():
-            print(f"👤 Ignored sender open (query param matched stored sender): {sender_email}")
+            print(f"👤 Ignored sender open (query param matched)")
             return response
 
-        # 2) If sender_token provided, verify HMAC against stored sender
+        # 2) Token match
         if sender_token and stored_sender_email:
             if verify_sender_token(sender_token, stored_sender_email, track_id):
-                print(f"👤 Ignored sender open (valid sender token for {stored_sender_email})")
+                print(f"👤 Ignored sender open (valid token)")
                 return response
 
-        # 3) If referer indicates Gmail sent folder, ignore
+        # 3) Referer match (Gmail Sent)
         if is_gmail_sent_view(referer):
-            print(f"📬 Ignored Gmail sent folder open (referer indicates sent)")
+            print(f"📬 Ignored Gmail sent folder open")
             return response
+        # ------------------------------
 
+        # Log the Open Event with Enhanced Data
+        cur.execute("""
+            INSERT INTO events (
+                track_id, event_type, ip_address, user_agent, is_bot, via_proxy,
+                country, city, os, browser, device, referrer
+            ) VALUES (%s, 'open', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (
+            track_id, client_ip, request.headers.get("User-Agent", ""), is_bot, via_proxy,
+            country, city, os_name, browser_name, device_name, referer
+        ))
+        conn.commit()
+        print(f"✅ Logged open for {track_id} from {city}, {country}")
+
+    except Exception as e:
+        print(f"❌ Error logging open: {e}")
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+    return response
         # 4) Detect Google proxy
         is_google_proxy = is_google_proxy_request(ua)
         is_google_scanner = is_google_scanner_ip(client_ip)
@@ -400,3 +433,14 @@ def valid_uuid(value):
         return True
     except Exception:
         return False
+
+def get_location(ip):
+    try:
+        response = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city", timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                return data.get("country"), data.get("city")
+    except Exception:
+        pass
+    return None, None
