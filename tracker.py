@@ -79,6 +79,14 @@ def valid_uuid(value):
     except Exception:
         return False
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "tracker"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.post("/register_send")
 def register_send(payload: dict):
     # Expects: { "track_id": "...", "recipient": "...", "sender": "...", "subject": "..." }
