@@ -150,7 +150,7 @@ async def pixel(
     cur = None
     try:
         conn = get_conn()
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
 
         # Fetch send info
         cur.execute("SELECT track_id, recipient_email, sender_email, sender_ip, created_at FROM sends WHERE track_id = %s", (track_id,))
@@ -261,7 +261,7 @@ def get_status(
     recipient_email: str = Query(None)
 ):
     conn = get_conn()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
 
     # Check for Active Status (Duration > 60s)
     # We prioritize 'active' over 'read'
