@@ -25,162 +25,90 @@ app.add_middleware(
 )
 
 load_dotenv()
-DB_URL = os.getenv("DATABASE_URL")
+
+# --- Configuration ---
+PIXEL_BYTES = (
+    b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89'
+    b'\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+)
+GOOGLE_PROXY_IPS = ["66.249.80.0/20", "66.102.0.0/20", "74.125.0.0/16", "64.233.160.0/19"]
+HMAC_SECRET = os.getenv("HMAC_SECRET", "supersecretkey")
 
 def get_conn():
-    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor, sslmode="require")
+    return psycopg2.connect(os.getenv("DATABASE_URL"), sslmode="require")
 
-PIXEL_BYTES = bytes.fromhex(
-    "89504E470D0A1A0A0000000D4948445200000001000000010806000000"
-    "1F15C4890000000A49444154789C6360000000020001E221BC33000000"
-    "0049454E44AE426082"
-)
+def is_google_proxy_request(user_agent):
+    return "googleimageproxy" in user_agent.lower()
 
-# Add a secret key for HMAC verification
-HMAC_SECRET = os.getenv("HMAC_SECRET", "fallback-secret-key-change-this-in-production")
-
-def generate_sender_token(sender_email, track_id, timestamp=None):
-    if timestamp is None:
-        timestamp = str(int(time.time()))
-    message = f"{sender_email}:{track_id}:{timestamp}"
-    signature = hmac.new(
-        HMAC_SECRET.encode(),
-        message.encode(),
-        hashlib.sha256
-    ).hexdigest()
-    return f"{timestamp}:{signature}"
-
-
-def verify_sender_token(token, sender_email, track_id, max_age=3600):
+def is_google_scanner_ip(ip):
     try:
-        timestamp_str, signature = token.split(":")
-        timestamp = int(timestamp_str)
-        if time.time() - timestamp > max_age:
-            return False
-        expected_message = f"{sender_email}:{track_id}:{timestamp_str}"
-        expected_signature = hmac.new(
-            HMAC_SECRET.encode(),
-            expected_message.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        return hmac.compare_digest(signature, expected_signature)
+        ip_obj = ipaddress.ip_address(ip)
+        for cidr in GOOGLE_PROXY_IPS:
+            if ip_obj in ipaddress.ip_network(cidr):
+                return True
+    except ValueError:
+        pass
+    return False
+
+def verify_sender_token(token, sender_email, track_id):
+    try:
+        payload = f"{sender_email}:{track_id}"
+        expected_signature = hmac.new(HMAC_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(token, expected_signature)
     except Exception:
         return False
 
+def is_gmail_sent_view(referer):
+    return "mail.google.com" in referer and "sent" in referer
 
-def is_internal_ip(ip: str) -> bool:
+def get_location(ip):
     try:
-        ip_obj = ipaddress.ip_address(ip)
-        return (
-            ip_obj.is_loopback or
-            ip_obj.is_private or
-            ip_obj.is_reserved or
-            ip_obj.is_link_local or
-            ip_obj.is_multicast or
-            str(ip_obj).startswith('127.') or
-            str(ip_obj).startswith('10.') or
-            str(ip_obj).startswith('192.168.') or
-            (str(ip_obj).startswith('172.') and 16 <= ip_obj.packed[1] <= 31) or
-            str(ip_obj) == '0.0.0.0'
-        )
-    except ValueError:
+        response = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city", timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                return data.get("country"), data.get("city")
+    except Exception:
+        pass
+    return None, None
+
+def valid_uuid(value):
+    try:
+        uuid.UUID(value)
         return True
-
-
-def is_google_proxy_request(ua: str) -> bool:
-    # Google proxy detection based on User-Agent
-    return any(p in ua for p in ["googleimageproxy", "ggpht.com", "imageproxy"])
-
-def is_google_scanner_ip(ip: str) -> bool:
-    # Known Google scanner IP ranges
-    # 72.14.x.x - Scanner
-    # Removed 66.249.x.x as it is used for real mobile opens
-    if ip.startswith("72.14."): return True
-    return False
-
-def is_gmail_sent_view(referer: str) -> bool:
-    if "mail.google.com" not in referer:
+    except Exception:
         return False
-    sent_indicators = ["in%3Asent", "in:sent", "/#sent", "#sent", "label/sent", "mail/sent", "sent%20mail", "qm_sent", "ib_sent"]
-    return any(ind in referer for ind in sent_indicators)
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    print(f"➡️ Incoming request: {request.method} {request.url}")
-    response = await call_next(request)
-    print(f"⬅️ Response status: {response.status_code}")
-    return response
+@app.post("/register_send")
+def register_send(payload: dict):
+    # Expects: { "track_id": "...", "recipient": "...", "sender": "...", "subject": "..." }
+    track_id = payload.get("track_id")
+    recipient = payload.get("recipient")
+    sender = payload.get("sender")
+    subject = payload.get("subject")
+    
+    if not track_id or not recipient:
+        raise HTTPException(status_code=400, detail="Missing track_id or recipient")
 
-
-@app.get("/")
-async def health_check():
-    return {"status": "ok"}
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-@app.post("/_register_send")
-async def register_send(payload: dict, request: Request):
-    """Register a send. sender_email is optional; if missing we store NULL.
-    Automation should send sender_email when available. This endpoint will no
-    longer reject payloads missing sender_email."""
-    cur = None
-    conn = None
+    conn = get_conn()
+    cur = conn.cursor()
     try:
-        sender_ip = request.client.host
-        print(f"📝 Register send payload: {payload}")
-        print(f"📝 Sender IP: {sender_ip}")
-
-        # required fields: track_id + recipient_email
-        required_fields = ["track_id", "recipient_email"]
-        for field in required_fields:
-            if field not in payload:
-                print(f"❌ Missing required field: {field}")
-                return JSONResponse({"ok": False, "error": f"Missing field: {field}"}, status_code=400)
-
-        conn = get_conn()
-        cur = conn.cursor()
-
-        # allow optional sender_email and subject
-        sender_email = payload.get("sender_email")
-        subject = payload.get("subject")
-        gmail_thread_id = payload.get("gmail_thread_id")
-
         cur.execute("""
-            INSERT INTO sends (track_id, recipient_email, gmail_message_id, gmail_thread_id, sender_email, sender_ip, subject)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (track_id) DO UPDATE SET
+            INSERT INTO sends (track_id, recipient_email, sender_email, subject)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (track_id) DO UPDATE 
+            SET subject = EXCLUDED.subject,
                 recipient_email = EXCLUDED.recipient_email,
-                gmail_message_id = EXCLUDED.gmail_message_id,
-                gmail_thread_id = EXCLUDED.gmail_thread_id,
-                sender_email = COALESCE(EXCLUDED.sender_email, sends.sender_email),
-                sender_ip = COALESCE(EXCLUDED.sender_ip, sends.sender_ip),
-                subject = COALESCE(EXCLUDED.subject, sends.subject)
-        """, (
-            payload["track_id"],
-            payload["recipient_email"],
-            payload.get("gmail_message_id"),
-            gmail_thread_id,
-            sender_email,
-            sender_ip,
-            subject
-        ))
+                sender_email = EXCLUDED.sender_email
+        """, (track_id, recipient, sender, subject))
         conn.commit()
-        print(f"✅ Registered send for {payload['recipient_email']} (Subject: {subject})")
-        return JSONResponse({"ok": True, "track_id": payload["track_id"]})
-
+        return {"status": "registered", "track_id": track_id}
     except Exception as e:
-        print(f"❌ register_send error: {e}")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
-
+        cur.close()
+        conn.close()
 
 @app.get("/pixel/{track_id}.png")
 async def pixel(
@@ -309,6 +237,7 @@ async def pixel(
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
+
 @app.get("/click/{track_id}")
 async def click(track_id: str, url: str):
     if not valid_uuid(track_id):
@@ -334,15 +263,20 @@ def get_status(
     conn = get_conn()
     cur = conn.cursor()
 
-    # We consider a message 'read' if:
-    #  - there exists a direct open event (via_proxy = FALSE) AND is_bot = FALSE
-    #  OR
-    #  - there exist at least 1 proxy open event (via_proxy = TRUE) AND is_bot = FALSE
-    #    (Changed from 2 to 1 because we now filter bots via time-window)
-
+    # Check for Active Status (Duration > 60s)
+    # We prioritize 'active' over 'read'
+    
     if recipient_email:
         cur.execute("""
             SELECT CASE
+                WHEN (
+                    SELECT MAX(duration) FROM events e
+                    JOIN sends s ON e.track_id = s.track_id
+                    WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s)
+                      AND s.recipient_email = %s
+                      AND e.event_type = 'open'
+                      AND e.is_bot = FALSE
+                ) > 60 THEN 'active'
                 WHEN EXISTS (
                     SELECT 1 FROM events e
                     JOIN sends s ON e.track_id = s.track_id
@@ -361,12 +295,20 @@ def get_status(
                 ) THEN 'sent'
                 ELSE 'unknown'
             END AS status
-        """, (gmail_message_id, gmail_message_id, recipient_email, 
+        """, (gmail_message_id, gmail_message_id, recipient_email,
+              gmail_message_id, gmail_message_id, recipient_email, 
               gmail_message_id, gmail_message_id, recipient_email, 
               gmail_message_id, gmail_message_id, recipient_email))
     else:
         cur.execute("""
             SELECT CASE
+                WHEN (
+                    SELECT MAX(duration) FROM events e
+                    JOIN sends s ON e.track_id = s.track_id
+                    WHERE (s.gmail_message_id = %s OR s.gmail_thread_id = %s)
+                      AND e.event_type = 'open'
+                      AND e.is_bot = FALSE
+                ) > 60 THEN 'active'
                 WHEN EXISTS (
                     SELECT 1 FROM events e
                     JOIN sends s ON e.track_id = s.track_id
@@ -384,7 +326,8 @@ def get_status(
                 ) THEN 'sent'
                 ELSE 'unknown'
             END AS status
-        """, (gmail_message_id, gmail_message_id, 
+        """, (gmail_message_id, gmail_message_id,
+              gmail_message_id, gmail_message_id, 
               gmail_message_id, gmail_message_id, 
               gmail_message_id, gmail_message_id))
 
@@ -393,26 +336,7 @@ def get_status(
     conn.close()
 
     if not row or row["status"] == "unknown":
-        print(f"⚠️ No send or open record found for Gmail ID: {gmail_message_id} ({recipient_email})")
+        # print(f"⚠️ No send or open record found for Gmail ID: {gmail_message_id} ({recipient_email})")
         return JSONResponse({"status": "unknown"}, status_code=404)
 
     return JSONResponse({"status": row["status"]})
-
-
-def valid_uuid(value):
-    try:
-        uuid.UUID(value)
-        return True
-    except Exception:
-        return False
-
-def get_location(ip):
-    try:
-        response = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city", timeout=2)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("status") == "success":
-                return data.get("country"), data.get("city")
-    except Exception:
-        pass
-    return None, None
