@@ -1,4 +1,3 @@
-import asyncio
 import requests
 from user_agents import parse
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -154,6 +153,12 @@ async def pixel(
     print(f"🔍 Pixel request - Track ID: {track_id}, IP: {client_ip}")
     print(f"   Location: {city}, {country} | OS: {os_name} | Browser: {browser_name}")
 
+    # Prepare response
+    response = StreamingResponse(io.BytesIO(PIXEL_BYTES), media_type="image/png")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+
     conn = None
     cur = None
     try:
@@ -163,41 +168,43 @@ async def pixel(
         # Fetch send info
         cur.execute("SELECT track_id, recipient_email, sender_email, sender_ip, created_at FROM sends WHERE track_id = %s", (track_id,))
         send_row = cur.fetchone()
-        
-        should_log = True
         if not send_row:
             print(f"⚠️ No send record found for track_id: {track_id}")
-            should_log = False
-        else:
-            stored_sender_email = send_row.get("sender_email")
+            return response
 
-            # --- Sender Filtering Logic ---
-            if sender_email and stored_sender_email and sender_email.lower() == stored_sender_email.lower():
-                print(f"👤 Ignored sender open (query param matched)")
-                should_log = False
-            elif sender_token and stored_sender_email:
-                if verify_sender_token(sender_token, stored_sender_email, track_id):
-                    print(f"👤 Ignored sender open (valid token)")
-                    should_log = False
-            elif is_gmail_sent_view(referer):
-                print(f"📬 Ignored Gmail sent folder open")
-                should_log = False
-            # ------------------------------
+        stored_sender_email = send_row.get("sender_email")
 
-        if should_log:
-            # Log the Open Event
-            cur.execute("""
-                INSERT INTO events (
-                    track_id, event_type, ip_address, user_agent, is_bot, via_proxy,
-                    country, city, os, browser, device, referrer
-                ) VALUES (%s, 'open', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """, (
-                track_id, client_ip, request.headers.get("User-Agent", ""), is_bot, via_proxy,
-                country, city, os_name, browser_name, device_name, referer
-            ))
-            conn.commit()
-            print(f"✅ Logged open for {track_id} from {city}, {country}")
+        # --- Sender Filtering Logic ---
+        # 1) Query param match
+        if sender_email and stored_sender_email and sender_email.lower() == stored_sender_email.lower():
+            print(f"👤 Ignored sender open (query param matched)")
+            return response
+
+        # 2) Token match
+        if sender_token and stored_sender_email:
+            if verify_sender_token(sender_token, stored_sender_email, track_id):
+                print(f"👤 Ignored sender open (valid token)")
+                return response
+
+        # 3) Referer match (Gmail Sent)
+        if is_gmail_sent_view(referer):
+            print(f"📬 Ignored Gmail sent folder open")
+            return response
+        # ------------------------------
+
+        # Log the Open Event with Enhanced Data
+        cur.execute("""
+            INSERT INTO events (
+                track_id, event_type, ip_address, user_agent, is_bot, via_proxy,
+                country, city, os, browser, device, referrer
+            ) VALUES (%s, 'open', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (
+            track_id, client_ip, request.headers.get("User-Agent", ""), is_bot, via_proxy,
+            country, city, os_name, browser_name, device_name, referer
+        ))
+        conn.commit()
+        print(f"✅ Logged open for {track_id} from {city}, {country}")
 
     except Exception as e:
         print(f"❌ Error logging open: {e}")
@@ -205,45 +212,6 @@ async def pixel(
         if cur: cur.close()
         if conn: conn.close()
 
-    # Streaming Generator for Duration Tracking
-    async def image_stream():
-        start_time = time.time()
-        try:
-            yield PIXEL_BYTES
-            while True:
-                await asyncio.sleep(1)
-                yield b""
-        except Exception:
-            pass
-        finally:
-            duration = int(time.time() - start_time)
-            print(f"⏱️ Duration for {track_id}: {duration}s")
-            
-            # Update Duration in DB
-            try:
-                conn = get_conn()
-                cur = conn.cursor()
-                # Update the latest open event for this track_id
-                cur.execute("""
-                    UPDATE events 
-                    SET duration = %s 
-                    WHERE id = (
-                        SELECT id FROM events 
-                        WHERE track_id = %s AND event_type = 'open' 
-                        ORDER BY created_at DESC LIMIT 1
-                    )
-                """, (duration, track_id))
-                conn.commit()
-                cur.close()
-                conn.close()
-            except Exception as e:
-                print(f"❌ Error updating duration: {e}")
-
-    # Return Streaming Response
-    response = StreamingResponse(image_stream(), media_type="image/png")
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
     return response
 
 @app.get("/click/{track_id}")
